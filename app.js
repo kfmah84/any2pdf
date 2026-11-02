@@ -54,40 +54,71 @@ for(const id of ['paper','margin','gap','quality','dpi'])$(id).addEventListener(
 $('limit').onchange=()=>{const enabled=$('limit').checked;$('limitOptions').hidden=!enabled;$('manual').classList.toggle('disabled',enabled);$('quality').disabled=enabled;$('dpi').disabled=enabled};
 $('reset').onclick=()=>{items=[];render();status('Page cleared.')};
 new ResizeObserver(layout).observe($('sheet'));
-// A tiny binary PDF writer: one JPEG page embedded at the exact paper dimensions.
-function pdfFromJpeg(jpeg,width,height,paperWidth,paperHeight){
+// Keep the rendered page appearance and add a positioned, searchable text layer.
+function pdfText(value){return '('+value.replace(/[^\x20-\x7e]/g,'?').replace(/[\\()]/g,'\\$&')+')'}
+function pdfUnicode(value){return 'FEFF'+Array.from({length:value.length},(_,i)=>value.charCodeAt(i).toString(16).padStart(4,'0')).join('').toUpperCase()}
+function pdfFilename(date=new Date()){
+ const pad=value=>String(value).padStart(2,'0');
+ return String(date.getFullYear()).padStart(4,'0')+pad(date.getMonth()+1)+pad(date.getDate())+'_'+pad(date.getHours())+pad(date.getMinutes())+pad(date.getSeconds())+'.pdf';
+}
+function pdfFromJpeg(jpeg,width,height,paperWidth,paperHeight,captions=[]){
  const encode=s=>new TextEncoder().encode(s),parts=[],offsets=[0];let offset=0;
  const push=data=>{const bytes=typeof data==='string'?encode(data):data;parts.push(bytes);offset+=bytes.length};
  const object=(id,body)=>{offsets[id]=offset;push(`${id} 0 obj\n`);push(body);push('\nendobj\n')};
  const w=paperWidth*72/25.4,h=paperHeight*72/25.4;
- push('%PDF-1.4\n');object(1,'<< /Type /Catalog /Pages 2 0 R >>');object(2,'<< /Type /Pages /Kids [3 0 R] /Count 1 >>');object(3,`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>`);
+ push('%PDF-1.4\n');object(1,'<< /Type /Catalog /Pages 2 0 R >>');object(2,'<< /Type /Pages /Kids [3 0 R] /Count 1 >>');object(3,`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im0 4 0 R >> /Font << /F1 6 0 R >> >> /Contents 5 0 R >>`);
  offsets[4]=offset;push(`4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`);push(jpeg);push('\nendstream\nendobj\n');
- const stream=`q\n${w} 0 0 ${h} 0 0 cm\n/Im0 Do\nQ\n`;object(5,`<< /Length ${encode(stream).length} >>\nstream\n${stream}endstream`);
- const xref=offset;push('xref\n0 6\n0000000000 65535 f \n');for(let i=1;i<=5;i++)push(String(offsets[i]).padStart(10,'0')+' 00000 n \n');push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);return new Blob(parts,{type:'application/pdf'});
+ let stream=`q\n${w} 0 0 ${h} 0 0 cm\n/Im0 Do\nQ\n`;
+ // ActualText preserves Unicode for copying and extraction, including surrogate pairs.
+ // Invisible text overlays the canvas text without changing their appearance.
+ for(const line of captions){
+  if(!line.text.length)continue;
+  const fontSize=line.size*72/25.4,x=line.x*72/25.4,y=h-(line.y+line.size*.8)*72/25.4;
+  stream+=`/Span << /ActualText <${pdfUnicode(line.text)}> >> BDC\nBT /F1 ${fontSize} Tf 3 Tr ${line.scale} Tz 1 0 0 1 ${x} ${y} Tm ${pdfText(line.text)} Tj ET\nEMC\n`;
+ }object(5,`<< /Length ${encode(stream).length} >>\nstream\n${stream}endstream`);
+ object(6,'<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>');
+ const xref=offset;push('xref\n0 7\n0000000000 65535 f \n');for(let i=1;i<=6;i++)push(String(offsets[i]).padStart(10,'0')+' 00000 n \n');push(`trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);return new Blob(parts,{type:'application/pdf'});
 }
 function wrapText(ctx,text,maxWidth){const lines=[];for(const paragraph of text.split('\n')){let line='';for(const char of Array.from(paragraph)){if(ctx.measureText(line+char).width>maxWidth&&line){lines.push(line);line=char}else line+=char}lines.push(line)}return lines}
-async function makePdf(dpi,quality){
- const [pw,ph]=dimensions(),s=settings(),px=dpi/25.4,canvas=document.createElement('canvas');canvas.width=Math.round(pw*px);canvas.height=Math.round(ph*px);
- const ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.imageSmoothingQuality='high';
+async function makePdf(dpi,quality,job){
+ const {paper:[pw,ph],settings:s,items:pageItems,columns,rows}=job,px=dpi/25.4,canvas=document.createElement('canvas');canvas.width=Math.round(pw*px);canvas.height=Math.round(ph*px);
+ const captions=[],ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.imageSmoothingQuality='high';
  const cw=(pw-2*s.margin-(columns-1)*s.gap)/columns,ch=(ph-2*s.margin-(rows-1)*s.gap)/rows;
  if(cw<=0||ch<=0)throw Error('Reduce the margin or spacing to fit this grid.');
- items.slice(0,columns*rows).forEach((item,index)=>{
+ pageItems.forEach((item,index)=>{
   const x=(s.margin+(index%columns)*(cw+s.gap))*px,y=(s.margin+Math.floor(index/columns)*(ch+s.gap))*px;
   const caption=item.caption.trim();ctx.font=`${3.3*px}px Arial`;const lines=caption?wrapText(ctx,caption,cw*px-2*px):[];const lineHeight=4.3*px,captionH=lines.length?lines.length*lineHeight+2*px:0;
   if(captionH>ch*px*.65)throw Error(`Caption ${index+1} is too long for this grid. Shorten the caption or use fewer rows.`);
-  if(item.image){const bw=cw*px*item.scale,bh=(ch*px-captionH)*item.scale;const ratio=Math.min(bw/item.image.width,bh/item.image.height);const iw=item.image.width*ratio,ih=item.image.height*ratio;ctx.drawImage(item.image,x+(cw*px-iw)/2,y+(ch*px-captionH-ih)/2,iw,ih)}
-  if(lines.length){ctx.fillStyle='#233b35';ctx.textAlign='center';ctx.textBaseline='top';lines.forEach((line,n)=>ctx.fillText(line,x+cw*px/2,y+ch*px-captionH+2*px+n*lineHeight))}
+  if(item.image){const bw=cw*px*item.scale,bh=(ch*px-captionH)*item.scale;const ratio=Math.min(bw/item.image.width,bh/item.image.height);const iw=item.image.width*ratio,ih=item.image.height*ratio;const ix=x+(cw*px-iw)/2,iy=y+(ch*px-captionH-ih)/2;
+   ctx.drawImage(item.image,ix,iy,iw,ih);
+   for(const word of item.ocr||[]){
+    const size=word.height*ih/px;
+    captions.push({text:word.text,x:(ix+word.x*iw)/px,y:(iy+word.y*ih)/px,size,scale:100*word.width*iw/(word.text.length*size*px*.6)});
+   }}
+  if(lines.length){ctx.fillStyle='#233b35';ctx.textAlign='center';ctx.textBaseline='top';lines.forEach((line,n)=>{
+   const top=y+ch*px-captionH+2*px+n*lineHeight,measured=ctx.measureText(line).width;
+   ctx.fillText(line,x+cw*px/2,top);
+   captions.push({text:line,x:(x+cw*px/2-measured/2)/px,y:top/px,size:3.3,scale:line.length?100*measured/(line.length*3.3*px*.6):100});
+  })}
  });
- const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',quality));if(!blob)throw Error('Could not render this page. Try a lower DPI.');const bytes=new Uint8Array(await blob.arrayBuffer());const pdf=pdfFromJpeg(bytes,canvas.width,canvas.height,pw,ph);canvas.width=canvas.height=1;return pdf;
+ const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',quality));if(!blob)throw Error('Could not render this page. Try a lower DPI.');const bytes=new Uint8Array(await blob.arrayBuffer());const pdf=pdfFromJpeg(bytes,canvas.width,canvas.height,pw,ph,captions);canvas.width=canvas.height=1;return pdf;
 }
 $('export').onclick=async()=>{
  if(!items.slice(0,columns*rows).some(i=>i.image)){status('Add at least one image before exporting.');return}
+ const job={paper:dimensions(),settings:settings(),columns,rows,items:items.slice(0,columns*rows).map(item=>({...item})),ocr:$('ocr').checked,limited:$('limit').checked,maximum:number('maxSize',.01,100,2)*1000000};
+ const main=document.querySelector('main');main.inert=true;
  $('export').disabled=true;status('Preparing your PDF…');
- try{await new Promise(r=>setTimeout(r,30));let blob;const s=settings();
- if($('limit').checked){const maximum=number('maxSize',.01,100,2)*1000000;const attempts=[[300,.92],[250,.85],[200,.75],[150,.65],[120,.5],[96,.4],[72,.3],[50,.2],[36,.1],[24,.08]];for(const [dpi,q]of attempts){status(`Finding a fit… ${dpi} DPI`);await new Promise(r=>setTimeout(r,0));blob=await makePdf(dpi,q);if(blob.size<=maximum)break}if(blob.size>maximum)throw Error('This size limit cannot be met. Increase the maximum file size.');}
- else blob=await makePdf(s.dpi,s.quality);
- const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='any2pdf-'+$('paper').value+'.pdf';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);status(`PDF downloaded · ${(blob.size/1000000).toFixed(2)} MB`);
- }catch(e){status(e.message)}finally{$('export').disabled=false}
+ try{await new Promise(r=>setTimeout(r,30));let blob;const s=job.settings;
+ if(job.ocr){
+  const withImages=job.items.filter(item=>item.image);
+  const results=await OfflineOCR.recognize(withImages.map(item=>item.image),(current,total,progress)=>status(`Reading image text on your device... ${current} / ${total} (${Math.round(progress*100)}%)`));
+  withImages.forEach((item,index)=>item.ocr=results[index]);
+ }
+
+ if(job.limited){const maximum=job.maximum;const attempts=[[300,.92],[250,.85],[200,.75],[150,.65],[120,.5],[96,.4],[72,.3],[50,.2],[36,.1],[24,.08]];for(const [dpi,q]of attempts){status(`Finding a fit… ${dpi} DPI`);await new Promise(r=>setTimeout(r,0));blob=await makePdf(dpi,q,job);if(blob.size<=maximum)break}if(blob.size>maximum)throw Error('This size limit cannot be met. Increase the maximum file size.');}
+ else blob=await makePdf(s.dpi,s.quality,job);
+ const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=pdfFilename();a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);status(`PDF downloaded · ${(blob.size/1000000).toFixed(2)} MB`);
+ }catch(e){status('PDF export failed: '+(e.message||String(e)))}finally{$('export').disabled=false;main.inert=false}
 };
 $('print').onclick=()=>{const [w,h]=dimensions();let style=$('printSize');if(!style){style=document.createElement('style');style.id='printSize';document.head.append(style)}style.textContent=`@page{size:${w}mm ${h}mm;margin:0}`;status('Use “Save as PDF” in the print dialog. Download PDF applies quality and size controls.');window.print()};
 render();
